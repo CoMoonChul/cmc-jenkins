@@ -1,0 +1,189 @@
+pipeline {
+    agent any
+    
+    environment {
+        CONFIG_FILE = "application-prod"
+        REPO_URL        = 'https://github.com/CoMoonChul/cmc.git'
+        BRANCH_NAME     = 'main'
+        HARBOR_REGISTRY = "172.24.47.243:9003"  // Harbor 주소 (HTTP와 포트 포함)
+        HARBOR_PROJECT  = "cmc"
+        OUT_HARBOR_REGISTRY = "harbor.ks.io:9003"
+        HARBOR_ID       = credentials('harborId')
+        HARBOR_PW       = credentials('harborPassword')
+        IMAGE_NAME      = "backend"
+        IMAGE_TAG       = "latest"
+        DOCKER_CREDENTIALS = "harbor-credentials"  // Jenkins에 저장된 Docker 인증 정보
+        sshPassword     = credentials('sshPassword')  // SSH 비밀번호
+        sshUser         = "woohyun"
+        sshHost         = "183.109.9.50"
+        sshPort         = "10200"
+        PROJECT_DIR     = "/home/woohyun/project"
+        BUILD_DIR       = "/home/woohyun/project/app_${BUILD_NUMBER}"  // 빌드별 고유한 디렉토리
+
+        // 배포 서버 접속 정보 (PEM 키 기반)
+        DEPLOY_HOST     = credentials('DEPLOY_HOST')      // 실제 배포 서버 IP로 변경
+        DEPLOY_USER     = "ubuntu"
+        PEM_KEY         = credentials('deploy-pem-key')
+        env_file        = credentials('env_file')
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                git branch: "${BRANCH_NAME}", url: "${REPO_URL}"
+            }
+        }
+        
+    stage('Read Environment Config') {
+        steps {
+            script {
+                CONFIG_FILE = "src/main/resources/${CONFIG_FILE}.yaml"
+                def yaml = readYaml file: CONFIG_FILE
+            }
+        }
+    }
+
+        stage('Gradle Build') {
+            steps {
+                sh '''
+                    echo "==== Granting Execution Permission to Gradle ===="
+                    chmod 755 gradlew
+                    
+                    echo "==== Running Gradle Build ===="
+                    ./gradlew clean bootjar
+                    
+                    echo "==== Moving JAR File ===="
+                    mv build/libs/*.jar app.jar
+                    
+                    echo "==== Listing Files ===="
+                    ls -al
+                '''
+            }
+        }
+
+        stage('Send JAR to Harbor Server') {
+            steps {
+                script {
+                    sh """
+                    echo "==== Creating Build Directory on Harbor Server ===="
+                    sshpass -p '${sshPassword}' ssh -o StrictHostKeyChecking=no -p ${sshPort} ${sshUser}@${sshHost} "mkdir -p ${BUILD_DIR}"
+                    
+                    echo "==== Sending app.jar and Dockerfile to Harbor Server ===="
+                    sshpass -p '${sshPassword}' scp -T -o StrictHostKeyChecking=no -P ${sshPort} /var/lib/jenkins/workspace/cmc-backend_PROD/app.jar ${sshUser}@${sshHost}:${BUILD_DIR}/
+                    sshpass -p '${sshPassword}' scp -T -o StrictHostKeyChecking=no -P ${sshPort} /var/lib/jenkins/workspace/cmc-backend_PROD/Dockerfile ${sshUser}@${sshHost}:${BUILD_DIR}/
+                    """
+                }
+            }
+        }
+
+        stage('Harbor Server: Build & Push Image') {
+            steps {
+                script {
+                    sh """
+                    echo "==== Running Docker Build/Push on Harbor Server ===="
+                    sshpass -p '${sshPassword}' ssh -o StrictHostKeyChecking=no -p ${sshPort} ${sshUser}@${sshHost} << 'EOF'
+                    
+                    echo "---- Moving to Build Directory ----"
+                    cd ${BUILD_DIR} || { echo "Error: Build directory not found!"; exit 1; }
+
+                    echo "---- Checking for Dockerfile ----"
+                    if [ ! -f Dockerfile ]; then
+                        echo "Error: Dockerfile not found!"
+                        exit 1
+                    fi
+
+                    echo "---- Removing Old Docker Image (if exists) ----"
+                    if docker image inspect ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG} >/dev/null 2>&1; then
+                        docker rmi ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}
+                    else
+                        echo "No old image to remove."
+                    fi
+
+                    echo "---- Logging into Harbor Registry ----"
+                    docker login ${HARBOR_REGISTRY} -u ${HARBOR_ID} -p ${HARBOR_PW}
+
+                    echo "---- Building New Docker Image ----"
+                    DOCKER_BUILDKIT=1 docker build --network=host -t ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG} .
+
+                    echo "---- Pushing Image to Harbor ----"
+                    docker push ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}
+
+                    echo "---- Pruning Unused Docker Images ----"
+                    docker image prune -f
+
+                    echo "==== Harbor Build & Push Completed ===="
+EOF
+                    """
+                }
+            }
+        }
+
+        stage('Copy .env File to Deploy Server') {
+            steps {
+                script {
+                        sh """
+                        echo "==== Checking .env file path ===="
+                        echo "ENV_FILE: $ENV_FILE"
+                        ls -al $ENV_FILE || { echo "Error: .env file not found!"; exit 1; }
+                        
+                        echo "==== Copying .env file to deploy server ===="
+                        scp -i "$PEM_KEY" $ENV_FILE ${DEPLOY_HOST}:/tmp/.env
+                        
+                        echo "==== Setting permissions and moving .env file ===="
+                        ssh -i "$PEM_KEY" ${DEPLOY_HOST} << 'EOF'
+                            sudo chmod 644 /tmp/.env
+                            sudo mv /tmp/.env /home/${DEPLOY_USER}/.env
+                            sudo ls -la /home/${DEPLOY_USER}/.env
+EOF
+                        """
+                }
+            }
+        }
+
+        stage('Deploy Server: Stop & Remove Old Containers') {
+            steps {
+                script {
+                    sh """
+                    echo "==== Connecting to Deploy Server & Cleaning Up ===="
+                    ssh -i "$PEM_KEY" ${DEPLOY_HOST} << 'EOF'
+                        echo ">> Stopping existing containers"
+                        docker ps -a --filter "ancestor=${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}" -q | xargs -r docker stop
+                        
+                        echo ">> Removing old containers"
+                        docker ps -a --filter "ancestor=${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}" -q | xargs -r docker rm
+EOF
+                    """
+                }
+            }
+        }
+
+        stage('Deploy Server: Pull & Run New Container') {
+            steps {
+                script {
+                    sh """
+                    echo "==== Deploy Server: Pulling Image & Running New Container ===="
+                    ssh -i "$PEM_KEY" ${DEPLOY_HOST} << 'EOF'
+                        echo ">> Logging into Harbor Registry"
+                        docker login ${OUT_HARBOR_REGISTRY} -u ${HARBOR_ID} -p ${HARBOR_PW}
+
+                        echo ">> Pulling latest Docker image"
+                        docker pull ${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}
+
+                        echo ">> Running new container with --env-file"
+                        docker run -d --name backend --network cmc-net -p 8080:8080 --env-file /home/${DEPLOY_USER}/.env ${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}
+EOF
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Deployment Successful!'
+        }
+        failure {
+            echo 'Deployment Failed!'
+        }
+    }
+}
