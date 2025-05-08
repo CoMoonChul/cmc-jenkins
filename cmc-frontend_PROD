@@ -1,0 +1,187 @@
+pipeline {
+    agent any
+    tools {
+        nodejs "NodeJS 22.14.0"
+    }
+
+    environment {
+        REPO_URL        = 'https://github.com/CoMoonChul/cmc-fe.git'
+        BRANCH_NAME     = 'main'
+
+        HARBOR_REGISTRY = credentials('HARBOR_REGISTRY')
+        OUT_HARBOR_REGISTRY = credentials('OUT_HARBOR_REGISTRY')
+        HARBOR_PROJECT  = "cmc"
+        IMAGE_NAME      = "frontend"
+        IMAGE_TAG       = "latest"
+
+        HARBOR_ID       = credentials('harborId')
+        HARBOR_PW       = credentials('harborPassword')
+
+        sshPassword     = credentials('sshPassword')
+        sshUser         = credentials('sshUser') 
+        sshHost         = credentials('sshHost') 
+        sshPort         = credentials('sshPort') 
+
+        PROJECT_DIR     = credentials('PROJECT_DIR') 
+        BUILD_DIR       = "${PROJECT_DIR}/app_${BUILD_NUMBER}"
+
+        DEPLOY_HOST     = credentials('DEPLOY_HOST')
+        DEPLOY_USER     = credentials('DEPLOY_USER')
+        PEM_KEY         = credentials('deploy-pem-key')
+        fe_env_file     = credentials('fe_env_file') // 파일 경로 저장된 .env.production
+    }
+    
+
+stages {
+    
+    stage('Check Node & pnpm') {
+        steps {
+            sh 'node -v'
+            sh 'corepack enable && corepack prepare pnpm@latest --activate'
+            sh 'pnpm -v'
+        }
+    }
+
+    stage('Checkout Frontend Code') {
+        steps {
+            git branch: "${BRANCH_NAME}", url: "${REPO_URL}"
+        }
+    }
+    
+    stage('Prepare .env.production') {
+        steps {
+            sh '''
+                echo ".env.production 복사 중"
+                mkdir -p ./env
+                rm -f ./env/.env.production || true
+                cp "$fe_env_file" ./env/.env.production
+            '''
+        }
+    }
+
+    stage('Install Dependencies & Generate OAG') {
+        steps {
+            sh '''
+                corepack enable
+                corepack prepare pnpm@latest --activate
+
+                pnpm install
+                pnpm oag:gen:prd
+                pnpm build
+            '''
+        }
+    }
+
+    stage('Send Build Folder to Harbor Server') {
+        steps {
+            script {
+                sh """
+                    echo "==== Creating Build Directory on Harbor Server ===="
+                    sshpass -p '${sshPassword}' ssh -o StrictHostKeyChecking=no -p ${sshPort} \\
+                        ${sshUser}@${sshHost} "mkdir -p ${BUILD_DIR}"
+    
+                    echo "==== Preparing Tar Directory in /tmp ===="
+                    rm -rf /tmp/frontend_tar_ready
+                    cp -r /var/lib/jenkins/workspace/cmc-frontend_PROD /tmp/frontend_tar_ready
+    
+                    echo "==== Compressing to app.tar.gz ===="
+                    tar -czf app.tar.gz -C /tmp/frontend_tar_ready .
+                    rm -rf /tmp/frontend_tar_ready
+    
+                    echo "==== Sending tar.gz to Harbor Server ===="
+                    sshpass -p '${sshPassword}' scp -P ${sshPort} app.tar.gz ${sshUser}@${sshHost}:${BUILD_DIR}/
+    
+                    echo "==== Extracting tar.gz on Harbor Server ===="
+                    sshpass -p '${sshPassword}' ssh -o StrictHostKeyChecking=no -p ${sshPort} ${sshUser}@${sshHost} \\
+                        "cd ${BUILD_DIR} && tar -xzf app.tar.gz && rm app.tar.gz"
+    
+                    echo "==== Cleanup local tar.gz ===="
+                    rm -f app.tar.gz
+                """
+            }
+        }
+    }
+
+    stage('Harbor Server: Build & Push Image') {
+        steps {
+            script {
+                sh """
+                    echo "==== Running Docker Build/Push on Harbor Server ===="
+                    sshpass -p '${sshPassword}' ssh -o StrictHostKeyChecking=no -p ${sshPort} ${sshUser}@${sshHost} << 'EOF'
+
+                    echo "---- Moving to Build Directory ----"
+                    cd ${BUILD_DIR} || {
+                        echo "Error: Build directory not found!"
+                        exit 1
+                    }
+
+                    echo "---- Logging into Harbor Registry ----"
+                    docker login ${HARBOR_REGISTRY} -u ${HARBOR_ID} -p ${HARBOR_PW}
+                    
+                    echo "---- Building New Docker Image ----"
+                    DOCKER_BUILDKIT=1 docker build --no-cache --progress=plain --network=host \\
+                        -t ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG} .
+                    
+                    echo "---- Pushing Image to Harbor ----"
+                    docker push ${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}
+
+                    docker image prune -f
+
+                    echo "==== Harbor Build & Push Completed ===="
+
+EOF
+                """
+            }
+        }
+    }
+
+        stage('Copy .env to Deploy Server') {
+            steps {
+                sh """
+                echo "==== Copying .env.production to Deploy Server ===="
+                scp -i "$PEM_KEY" "$fe_env_file" ${DEPLOY_HOST}:/tmp/.env.production
+
+                echo "==== Moving and Setting Permissions ===="
+                ssh -i "$PEM_KEY" ${DEPLOY_HOST} << 'EOF'
+                    sudo mkdir -p /home/${DEPLOY_USER}/fe
+                    sudo chmod 644 /tmp/.env.production
+                    sudo mv /tmp/.env.production /home/${DEPLOY_USER}/fe/.env.production
+EOF
+                """
+            }
+        }
+
+        stage('Stop & Remove Old Container') {
+            steps {
+                sh """
+                ssh -i "$PEM_KEY" ${DEPLOY_HOST} << 'EOF'
+                    docker ps -a --filter "ancestor=${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}" -q | xargs -r docker stop
+                    docker ps -a --filter "ancestor=${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}" -q | xargs -r docker rm
+EOF
+                """
+            }
+        }
+
+        stage('Run New Frontend Container') {
+            steps {
+                sh """
+                ssh -i "$PEM_KEY" ${DEPLOY_HOST} << 'EOF'
+                    docker login ${OUT_HARBOR_REGISTRY} -u ${HARBOR_ID} -p ${HARBOR_PW}
+                    docker rmi ${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}
+                    docker pull ${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}
+                    docker run -d --name frontend --network cmc-net -p 3000:3000 --env-file /home/${DEPLOY_USER}/fe/.env.production -v /etc/localtime:/etc/localtime:ro ${OUT_HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}
+EOF
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Next.js 프론트엔드 배포 성공!'
+        }
+        failure {
+            echo '❌ 프론트엔드 배포 실패... 로그 확인 요망'
+        }
+    }
+}
